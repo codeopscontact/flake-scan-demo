@@ -1,0 +1,118 @@
+name: Flake Scan (CodeOps demo)
+
+# CodeOps flake-scan demo — https://github.com/codeopscontact/flake-scan-demo
+#
+# Runs a chosen test command N times on a real CI runner and summarises
+# pass/fail per iteration in the job summary. Use it to measure a flake's
+# reproduction rate under true CI conditions (CPU, network, parallelism) —
+# a number, not an opinion.
+#
+# It runs two ways:
+#   * on a weekly schedule (using the default inputs below), so a creeping
+#     flake rate shows up before it starts blocking merges, and
+#   * on demand from the Actions tab ("Run workflow"), with your own command,
+#     e.g.  command: npx jest path/to/flaky.test.ts -t "checkout totals"
+#           command: pytest tests/test_flaky.py::test_checkout -x -q
+#
+# To use it in your own repo: copy this file to .github/workflows/, set the
+# default `command` to one suspect test, and add your project's setup steps
+# where marked below.
+
+on:
+  schedule:
+    # Weekly, Mondays 06:00 UTC. Scheduled runs use the input defaults.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Test command to repeat (a single test is best)"
+        required: true
+        default: "npm test"
+        type: string
+      iterations:
+        description: "How many times to run it"
+        required: true
+        default: "20"
+        type: string
+      continue_on_fail:
+        description: "Keep going after a failure (recommended: true, so you get a rate, not just the first failure)"
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  flake-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # >>> Add your project's setup here (install dependencies, build, etc.)
+      # e.g.:
+      # - uses: actions/setup-node@v4
+      #   with:
+      #     node-version: 20
+      #     cache: npm
+      # - run: npm ci
+
+      - name: Run test command repeatedly
+        shell: bash
+        env:
+          TEST_COMMAND: ${{ inputs.command }}
+          ITERATIONS: ${{ inputs.iterations }}
+          CONTINUE_ON_FAIL: ${{ inputs.continue_on_fail }}
+        run: |
+          mkdir -p flake-scan-logs
+          pass=0
+          fail=0
+          failed_iters=""
+          for i in $(seq 1 "$ITERATIONS"); do
+            echo "::group::Iteration $i / $ITERATIONS"
+            if bash -c "$TEST_COMMAND" > "flake-scan-logs/iter-$i.log" 2>&1; then
+              echo "Iteration $i: PASS"
+              pass=$((pass + 1))
+            else
+              echo "Iteration $i: FAIL (log: flake-scan-logs/iter-$i.log)"
+              tail -n 30 "flake-scan-logs/iter-$i.log" || true
+              fail=$((fail + 1))
+              failed_iters="$failed_iters $i"
+              if [ "$CONTINUE_ON_FAIL" != "true" ]; then
+                echo "::endgroup::"
+                break
+              fi
+            fi
+            echo "::endgroup::"
+          done
+
+          {
+            echo "## Flake scan summary (CodeOps demo)"
+            echo ""
+            echo "- Command: \`$TEST_COMMAND\`"
+            echo "- Iterations run: $((pass + fail)) / $ITERATIONS"
+            echo "- Passed: $pass"
+            echo "- Failed: $fail"
+            if [ "$fail" -gt 0 ]; then
+              echo "- Failed iterations:$failed_iters"
+              rate=$(awk -v f="$fail" -v t="$((pass + fail))" 'BEGIN { printf "%.1f", (t > 0 ? f * 100 / t : 0) }')
+              echo "- **Observed flake rate: ${rate}%**"
+            else
+              echo "- No failures observed. (For a suspected ~1-in-10 flake, run at least 100 iterations before calling it fixed.)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "pass=$pass fail=$fail" >> "$GITHUB_OUTPUT"
+          # The job FAILS if any iteration failed — a flake you measured is a failure you keep visible.
+          if [ "$fail" -gt 0 ]; then
+            exit 1
+          fi
+
+      - name: Upload per-iteration logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flake-scan-logs-${{ github.run_id }}
+          path: flake-scan-logs/
+          retention-days: 14
